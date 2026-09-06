@@ -1,0 +1,408 @@
+#property copyright "Converted from TradingView UT Bot"
+#property link      "https://www.mql5.com"
+#property version   "2.00"
+#property strict
+#property description "Improved automated UT Bot with better signal generation"
+
+#include <Trade\Trade.mqh>
+
+input int       KeyValue = 1;
+input int       ATRPeriod = 10;
+input bool      UseHeikinAshi = false;
+input double    RiskPercentage = 1.5;
+input double    TakeProfitMultiplier = 2.5;
+input bool      UseTrailingStop = true;
+input int       TrailingStopDistance = 20;
+input int       MagicNumber = 12345;
+input bool      EnableLogging = true;
+input int       MinProfitSignalBuffer = 5;
+input bool      RequireTrendConfirmation = true;
+
+CTrade trade;
+double xATR;
+double nLoss;
+double xATRTrailingStop = 0.0;
+double prevATRTrailingStop = 0.0;
+int pos = 0;
+int buyCount = 0;
+int sellCount = 0;
+int winCount = 0;
+int lossCount = 0;
+double totalProfit = 0;
+
+int OnInit()
+{
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(15);
+    
+    Print("=== UT Bot IMPROVED Started ===");
+    Print("Symbol: ", _Symbol, " | Timeframe: ", _Period);
+    Print("KeyValue: ", KeyValue, " | ATR Period: ", ATRPeriod);
+    Print("Risk: ", RiskPercentage, "% | TP Multiplier: ", TakeProfitMultiplier);
+    Print("Trailing Stop: ", UseTrailingStop, " | Distance: ", TrailingStopDistance);
+    
+    return INIT_SUCCEEDED;
+}
+
+void OnTick()
+{
+    CalculateATR();
+    CalculateTrailingStop();
+    
+    bool buy = CheckBuySignal();
+    bool sell = CheckSellSignal();
+    
+    HandleClosedPositions();
+    
+    if(buy && pos == 0)
+    {
+        ExecuteBuyTrade();
+        pos = 1;
+    }
+    
+    if(sell && pos == 0)
+    {
+        ExecuteSellTrade();
+        pos = -1;
+    }
+    
+    if(UseTrailingStop && PositionSelect(_Symbol))
+    {
+        UpdateTrailingStop();
+    }
+}
+
+void CalculateATR()
+{
+    int atrHandle = iATR(_Symbol, _Period, ATRPeriod);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        if(EnableLogging) Print("Error: Failed to create ATR handle");
+        return;
+    }
+    
+    double atrBuffer[];
+    ArraySetAsSeries(atrBuffer, true);
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) > 0)
+    {
+        xATR = atrBuffer[0];
+        nLoss = KeyValue * xATR;
+    }
+}
+
+void CalculateTrailingStop()
+{
+    prevATRTrailingStop = xATRTrailingStop;
+    double src = GetSource();
+    double src_prev = GetSourcePrevious();
+    
+    if(src > xATRTrailingStop && src_prev > xATRTrailingStop)
+    {
+        xATRTrailingStop = MathMax(xATRTrailingStop, src - nLoss);
+    }
+    else if(src < xATRTrailingStop && src_prev < xATRTrailingStop)
+    {
+        xATRTrailingStop = MathMin(xATRTrailingStop, src + nLoss);
+    }
+    else if(src > xATRTrailingStop)
+    {
+        xATRTrailingStop = src - nLoss;
+    }
+    else if(src < xATRTrailingStop)
+    {
+        xATRTrailingStop = src + nLoss;
+    }
+}
+
+bool CheckBuySignal()
+{
+    double src = GetSource();
+    
+    if(src <= xATRTrailingStop)
+        return false;
+    
+    double ema = iMA(_Symbol, _Period, 1, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double ema_prev = iMA(_Symbol, _Period, 1, 0, MODE_EMA, PRICE_CLOSE, 1);
+    
+    if(ema <= 0 || ema_prev <= 0)
+        return false;
+    
+    bool eemaCrossover = (ema_prev <= xATRTrailingStop) && (ema > xATRTrailingStop);
+    
+    if(!eemaCrossover)
+        return false;
+    
+    if(RequireTrendConfirmation)
+    {
+        double ema_fast = iMA(_Symbol, _Period, 5, 0, MODE_EMA, PRICE_CLOSE, 0);
+        double ema_slow = iMA(_Symbol, _Period, 20, 0, MODE_EMA, PRICE_CLOSE, 0);
+        if(ema_fast <= ema_slow)
+            return false;
+    }
+    
+    if(EnableLogging) Print("[BUY SIGNAL] Price: ", src, " | TS: ", xATRTrailingStop, " | EMA: ", ema);
+    
+    return true;
+}
+
+bool CheckSellSignal()
+{
+    double src = GetSource();
+    
+    if(src >= xATRTrailingStop)
+        return false;
+    
+    double ema = iMA(_Symbol, _Period, 1, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double ema_prev = iMA(_Symbol, _Period, 1, 0, MODE_EMA, PRICE_CLOSE, 1);
+    
+    if(ema <= 0 || ema_prev <= 0)
+        return false;
+    
+    bool emaCrossover = (ema_prev >= xATRTrailingStop) && (ema < xATRTrailingStop);
+    
+    if(!emaCrossover)
+        return false;
+    
+    if(RequireTrendConfirmation)
+    {
+        double ema_fast = iMA(_Symbol, _Period, 5, 0, MODE_EMA, PRICE_CLOSE, 0);
+        double ema_slow = iMA(_Symbol, _Period, 20, 0, MODE_EMA, PRICE_CLOSE, 0);
+        if(ema_fast >= ema_slow)
+            return false;
+    }
+    
+    if(EnableLogging) Print("[SELL SIGNAL] Price: ", src, " | TS: ", xATRTrailingStop, " | EMA: ", ema);
+    
+    return true;
+}
+
+void ExecuteBuyTrade()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    double stopLoss = xATRTrailingStop - (nLoss * 0.5);
+    double slDistance = ask - stopLoss;
+    
+    if(slDistance <= 0)
+    {
+        if(EnableLogging) Print("[ERROR] Invalid SL for BUY");
+        return;
+    }
+    
+    double takeProfit = ask + (slDistance * TakeProfitMultiplier);
+    double positionSize = CalculatePositionSize(slDistance);
+    
+    if(positionSize <= 0)
+    {
+        if(EnableLogging) Print("[ERROR] Position size invalid: ", positionSize);
+        return;
+    }
+    
+    if(trade.Buy(positionSize, _Symbol, ask, stopLoss, takeProfit, "UT Bot Buy"))
+    {
+        buyCount++;
+        if(EnableLogging) 
+        {
+            Print("=== BUY EXECUTED ===");
+            Print("Entry: ", ask, " | SL: ", stopLoss, " | TP: ", takeProfit);
+            Print("Size: ", positionSize, " | Risk: ", slDistance, " pips");
+        }
+    }
+    else
+    {
+        if(EnableLogging) Print("[ERROR] BUY failed: ", trade.ResultRetcodeDescription());
+    }
+}
+
+void ExecuteSellTrade()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    double stopLoss = xATRTrailingStop + (nLoss * 0.5);
+    double slDistance = stopLoss - bid;
+    
+    if(slDistance <= 0)
+    {
+        if(EnableLogging) Print("[ERROR] Invalid SL for SELL");
+        return;
+    }
+    
+    double takeProfit = bid - (slDistance * TakeProfitMultiplier);
+    double positionSize = CalculatePositionSize(slDistance);
+    
+    if(positionSize <= 0)
+    {
+        if(EnableLogging) Print("[ERROR] Position size invalid: ", positionSize);
+        return;
+    }
+    
+    if(trade.Sell(positionSize, _Symbol, bid, stopLoss, takeProfit, "UT Bot Sell"))
+    {
+        sellCount++;
+        if(EnableLogging) 
+        {
+            Print("=== SELL EXECUTED ===");
+            Print("Entry: ", bid, " | SL: ", stopLoss, " | TP: ", takeProfit);
+            Print("Size: ", positionSize, " | Risk: ", slDistance, " pips");
+        }
+    }
+    else
+    {
+        if(EnableLogging) Print("[ERROR] SELL failed: ", trade.ResultRetcodeDescription());
+    }
+}
+
+double CalculatePositionSize(double slDistance)
+{
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = accountBalance * (RiskPercentage / 100.0);
+    
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    
+    if(tickSize == 0 || tickValue == 0)
+    {
+        if(EnableLogging) Print("[ERROR] Invalid tick size/value");
+        return 0;
+    }
+    
+    double pipsRisk = slDistance / tickSize;
+    double riskPerLot = pipsRisk * tickValue;
+    
+    if(riskPerLot <= 0)
+    {
+        if(EnableLogging) Print("[ERROR] Risk per lot invalid: ", riskPerLot);
+        return 0;
+    }
+    
+    double lots = riskAmount / riskPerLot;
+    
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lots = MathMax(lots, minLot);
+    lots = MathMin(lots, maxLot);
+    lots = MathFloor(lots / lotStep) * lotStep;
+    
+    return lots;
+}
+
+void UpdateTrailingStop()
+{
+    if(!PositionSelect(_Symbol)) return;
+    
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    ulong ticket = PositionGetTicket(0);
+    
+    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+    {
+        double newSL = bid - (TrailingStopDistance * Point());
+        if(newSL > currentSL && newSL < bid)
+        {
+            trade.PositionModify(ticket, newSL, currentTP);
+            if(EnableLogging) Print("[TRAILING STOP] BUY updated to: ", newSL);
+        }
+    }
+    else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+    {
+        double newSL = ask + (TrailingStopDistance * Point());
+        if(newSL < currentSL && newSL > ask)
+        {
+            trade.PositionModify(ticket, newSL, currentTP);
+            if(EnableLogging) Print("[TRAILING STOP] SELL updated to: ", newSL);
+        }
+    }
+}
+
+void HandleClosedPositions()
+{
+    if(pos == 0) return;
+    
+    if(!PositionSelect(_Symbol))
+    {
+        double profit = 0;
+        
+        int deals = HistoryDealsTotal();
+        for(int i = deals - 1; i >= MathMax(0, deals - 5); i--)
+        {
+            ulong ticket = HistoryDealGetTicket(i);
+            if(ticket > 0)
+            {
+                string symbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+                int magic = (int)HistoryDealGetInteger(ticket, DEAL_MAGIC);
+                
+                if(symbol == _Symbol && magic == MagicNumber)
+                {
+                    profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+                    break;
+                }
+            }
+        }
+        
+        if(profit > 0)
+        {
+            winCount++;
+            totalProfit += profit;
+            if(EnableLogging) Print("[WIN] Closed with profit: $", profit);
+        }
+        else if(profit < 0)
+        {
+            lossCount++;
+            totalProfit += profit;
+            if(EnableLogging) Print("[LOSS] Closed with loss: $", profit);
+        }
+        
+        pos = 0;
+        
+        if(EnableLogging && (winCount + lossCount) % 5 == 0)
+        {
+            double winRate = (winCount > 0) ? (double)winCount / (winCount + lossCount) * 100 : 0;
+            Print("=== STATS === Wins: ", winCount, " | Losses: ", lossCount, " | Win Rate: ", winRate, "% | Total P&L: $", totalProfit);
+        }
+    }
+}
+
+double GetSource()
+{
+    if(UseHeikinAshi)
+    {
+        double open = iOpen(_Symbol, _Period, 0);
+        double high = iHigh(_Symbol, _Period, 0);
+        double low = iLow(_Symbol, _Period, 0);
+        double close = iClose(_Symbol, _Period, 0);
+        return (open + high + low + close) / 4.0;
+    }
+    return iClose(_Symbol, _Period, 0);
+}
+
+double GetSourcePrevious()
+{
+    if(UseHeikinAshi)
+    {
+        double open = iOpen(_Symbol, _Period, 1);
+        double high = iHigh(_Symbol, _Period, 1);
+        double low = iLow(_Symbol, _Period, 1);
+        double close = iClose(_Symbol, _Period, 1);
+        return (open + high + low + close) / 4.0;
+    }
+    return iClose(_Symbol, _Period, 1);
+}
+
+void OnDeinit(const int reason)
+{
+    double winRate = (winCount > 0) ? (double)winCount / (winCount + lossCount) * 100 : 0;
+    
+    Print("\n=== UT BOT STOPPED ===");
+    Print("Total Trades: ", buyCount + sellCount);
+    Print("Buy Signals: ", buyCount, " | Sell Signals: ", sellCount);
+    Print("Wins: ", winCount, " | Losses: ", lossCount);
+    Print("Win Rate: ", winRate, "%");
+    Print("Total P&L: $", totalProfit);
+    Print("========================");
+}
